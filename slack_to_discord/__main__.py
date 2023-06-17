@@ -19,6 +19,8 @@ def main():
     parser.add_argument("-e", "--end", help="The date to end importing at (YYYY-MM-DD)", required=False, default=None)
     parser.add_argument("-p", "--all-private", help="Import all channels as private channels in Discord", action="store_true", default=False)
     parser.add_argument("-r", "--real-names", help="Use real names from Slack instead of usernames", action="store_true", default=False)
+    parser.add_argument("--timeshift", help="Timeshift amount, in days", required=True, type=int)
+    parser.add_argument("--destchannel", help="Channel to send to (instead of a channel with the same name as the original)", required=True)
     parser.add_argument("-v", "--verbose", help="Show more verbose logs", action="store_true")
     args = parser.parse_args()
 
@@ -33,6 +35,8 @@ def main():
         real_names=args.real_names,
         start=args.start,
         end=args.end,
+        timeshift=args.timeshift,
+        destchannel=args.destchannel,
     )
 
 if __name__ == "__main__":

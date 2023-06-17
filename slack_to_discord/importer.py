@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import asyncio
 import contextlib
 import functools
 import glob
@@ -9,9 +10,10 @@ import logging
 import os
 import re
 import tempfile
+import time
 import textwrap
 from zipfile import ZipFile
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
 import discord
@@ -30,7 +32,8 @@ DATE_FORMAT = "%Y-%m-%d"
 TIME_FORMAT = "%H:%M"
 
 # Formatting options for messages
-MSG_FORMAT = "`{time}` {text}"
+MSG_FORMAT = "`#{channel}` {text}"
+USERNAME_FORMAT = "{username} in {year}"
 BACKUP_THREAD_NAME = "{date} {time}"  # used when the message to create the thread from has no text
 ATTACHMENT_TITLE_TEXT = "<*uploaded a file*> {title}"
 ATTACHMENT_ERROR_APPEND = "\n<original file not uploaded due to size restrictions. See original at <{url}>>"
@@ -46,6 +49,14 @@ EMOJI_RE = re.compile(r":([^ /<>:]+):(?::skin-tone-(\d):)?")
 
 __log__ = logging.getLogger(__name__)
 
+
+# Taken from <https://stackoverflow.com/a/54774814>
+def wait_until(end_datetime):
+    while True:
+        diff = (end_datetime - datetime.now()).total_seconds()
+        if diff < 0: return       # In case end_datetime was in past to begin with
+        time.sleep(diff/2)
+        if diff <= 0.1: return
 
 def emoji_replace(s, emoji_map):
     def replace(match):
@@ -233,8 +244,11 @@ def slack_channel_messages(d, channel_name, users, emoji_map, pins):
 
             dt = datetime.fromtimestamp(float(ts))
             msg = {
+                "channel": channel_name,
                 "userinfo": users.get(user_id, ("[unknown]", None)),
+                "username": users.get(user_id, ("[unknown]", None))[0],
                 "datetime": dt,
+                "year": dt.year,
                 "time": dt.strftime(TIME_FORMAT),
                 "date": dt.strftime(DATE_FORMAT),
                 "text": text,
@@ -375,7 +389,7 @@ def file_upload_attempts(data):
 
 class SlackImportClient(discord.Client):
 
-    def __init__(self, *args, data_dir, guild_name, channels, start, end, all_private, real_names, **kwargs):
+    def __init__(self, *args, data_dir, guild_name, channels, start, end, all_private, real_names, timeshift, destchannel, **kwargs):
         self._data_dir = data_dir
         self._guild_name = guild_name
         self._channels = channels or None
@@ -386,6 +400,8 @@ class SlackImportClient(discord.Client):
 
         self._prev_msg = None
         self._exception = None
+        self._timeshift = timeshift
+        self._destchannel = destchannel
 
         super().__init__(
             *args,
@@ -430,8 +446,8 @@ class SlackImportClient(discord.Client):
             for attempt in file_upload_attempts(data):
                 with contextlib.suppress(Exception):
                     sent = await send(
-                        username=msg["userinfo"][0],
-                        avatar_url=msg["userinfo"][1],
+                        username=USERNAME_FORMAT.format(**msg),
+                        #avatar_url=msg["userinfo"][1],
                         **attempt
                     )
                     if pin:
@@ -446,10 +462,7 @@ class SlackImportClient(discord.Client):
         return sent
 
     async def _run_import(self, g):
-        emoji_map = {x.name: str(x) for x in self.emojis}
-
         __log__.info("Starting to import messages")
-        c_chan, c_msg, start_time = 0, 0, datetime.now()
 
         existing_channels = {x.name: x for x in g.text_channels}
 
@@ -458,90 +471,64 @@ class SlackImportClient(discord.Client):
                 __log__.info("Cleaning up previous webhook %s", webhook)
                 await webhook.delete()
 
-        for chan_name, init_topic, pins, is_private in slack_channels(self._data_dir):
-            if self._channels is not None and chan_name.lower() not in self._channels:
-                __log__.info("Skipping channel '#%s' - not in the list of channels to import", chan_name)
+        await asyncio.gather(*[self._run_import_channel(g, chan_name, existing_channels[self._destchannel])
+                               for chan_name, init_topic, pins, is_private in slack_channels(self._data_dir)])
+
+    async def _run_import_channel(self, g, chan_name, dest_ch):
+        if self._channels is not None and chan_name.lower() not in self._channels:
+            __log__.info("Skipping channel '#%s' - not in the list of channels to import", chan_name)
+            return
+
+        emoji_map = {x.name: str(x) for x in self.emojis}
+        __log__.info("Processing channel '#%s'...", chan_name)
+
+        ch_webhook = await dest_ch.create_webhook(
+            name="SlackTimeshifted",
+            reason="For importing timeshifted messages",
+        )
+        ch_send = functools.partial(ch_webhook.send, wait=True)
+
+        self._prev_msg = None  # always start with the date in a new channel
+
+        for msg in slack_channel_messages(self._data_dir, chan_name, self._users, emoji_map, []):
+            # skip messages that are too early, stop when messages are too late
+            if self._end and msg["datetime"].date() > self._end:
+                break
+            elif self._start and  msg["datetime"].date() < self._start:
                 continue
 
-            ch = None
-            ch_webhook, ch_send = None, None
-            c_msg_start = c_msg
+            # Skip messages too old
+            msg_dt = datetime.combine(msg["datetime"].date(), msg["datetime"].time())
+            timeshifted = msg_dt + timedelta(days=self._timeshift)
+            if timeshifted < datetime.now():
+                __log__.info("Skipping message from %s", msg_dt)
+                continue
+            # Wait until messages are ready to post
+            if timeshifted > datetime.now():
+                __log__.info("Waiting until %s (%s)", timeshifted, (timeshifted-datetime.now()))
+                wait_until(timeshifted)
+                #wait_until(datetime.now()+timedelta(seconds=5)) # USE THIS FOR TESTING
 
-            self._prev_msg = None  # always start with the date in a new channel
+            # Send message and threaded replies
+            # TODO: fix date sep, we only want ONE, not one per message
+            #await self._handle_date_sep(ch, msg)
+            sent = await self._send_slack_msg(ch_send, msg)
+            if sent and msg["replies"]:
+                thread_name = (
+                    textwrap.wrap(msg.get("text") or "", max_lines=1, width=MAX_THREADNAME_SIZE, placeholder="…") or
+                    [BACKUP_THREAD_NAME.format(**msg).replace(":", "-")]  # ':' is not allowed in thread names
+                )[0]
+                thread = await sent.create_thread(name=thread_name)
+                try:
+                    thread_send = functools.partial(ch_send, thread=thread)
+                    for rmsg in msg["replies"]:
+                        await self._handle_date_sep(thread, rmsg)
+                        await self._send_slack_msg(thread_send, rmsg)
+                finally:
+                    await thread.edit(archived=True)
 
-            init_topic = emoji_replace(init_topic, emoji_map)
-
-            __log__.info("Processing channel '#%s'...", chan_name)
-
-            for msg in slack_channel_messages(self._data_dir, chan_name, self._users, emoji_map, pins):
-                # skip messages that are too early, stop when messages are too late
-                if self._end and msg["datetime"].date() > self._end:
-                    break
-                elif self._start and  msg["datetime"].date() < self._start:
-                    continue
-
-                # Now that we have a message to send, get/create the channel to send it to
-                if ch is None:
-                    if chan_name not in existing_channels:
-                        if self._all_private or is_private:
-                            __log__.info("Creating '#%s' as a private channel", chan_name)
-                            overwrites = {
-                                g.default_role: discord.PermissionOverwrite(read_messages=False),
-                                g.me: discord.PermissionOverwrite(read_messages=True),
-                            }
-                            ch = await g.create_text_channel(chan_name, topic=init_topic, overwrites=overwrites)
-                        else:
-                            __log__.info("Creating '#%s' as a public channel", chan_name)
-                            ch = await g.create_text_channel(chan_name, topic=init_topic)
-                    else:
-                        ch = existing_channels[chan_name]
-                    c_chan += 1
-
-                    ch_webhook = await ch.create_webhook(
-                        name="s2d-importer",
-                        reason="For importing messages into '#{}'".format(chan_name)
-                    )
-                    ch_send = functools.partial(ch_webhook.send, wait=True)
-
-                topic = msg["events"].get("topic", None)
-                if topic is not None and topic != ch.topic:
-                    # Note that the ratelimit is pretty extreme for this
-                    # (2 edits per 10 minutes) so it may take a while if there
-                    # a lot of topic changes
-                    await ch.edit(topic=topic)
-
-                # Send message and threaded replies
-                await self._handle_date_sep(ch, msg)
-                sent = await self._send_slack_msg(ch_send, msg)
-                c_msg += 1
-                if sent and msg["replies"]:
-                    thread_name = (
-                        textwrap.wrap(msg.get("text") or "", max_lines=1, width=MAX_THREADNAME_SIZE, placeholder="…") or
-                        [BACKUP_THREAD_NAME.format(**msg).replace(":", "-")]  # ':' is not allowed in thread names
-                    )[0]
-                    thread = await sent.create_thread(name=thread_name)
-                    try:
-                        thread_send = functools.partial(ch_send, thread=thread)
-                        for rmsg in msg["replies"]:
-                            await self._handle_date_sep(thread, rmsg)
-                            await self._send_slack_msg(thread_send, rmsg)
-                            c_msg += 1
-                    finally:
-                        await thread.edit(archived=True)
-
-                    # calculate next date separator based on the last message sent to the main channel
-                    self._prev_msg = msg
-
-            if ch_webhook:
-                await ch_webhook.delete()
-
-            __log__.info("Imported %s messages into '#%s'", c_msg - c_msg_start, chan_name)
-        __log__.info(
-            "Finished importing %d messages into %d channel(s) in %s",
-            c_msg,
-            c_chan,
-            datetime.now()-start_time
-        )
+                # calculate next date separator based on the last message sent to the main channel
+                self._prev_msg = msg
 
 
 def run_import(*, zipfile, token, **kwargs):
