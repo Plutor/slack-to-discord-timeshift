@@ -32,7 +32,7 @@ DATE_FORMAT = "%Y-%m-%d"
 TIME_FORMAT = "%H:%M"
 
 # Formatting options for messages
-MSG_FORMAT = "`#{channel}` {text}"
+MSG_FORMAT = "`[#{channel}]` {text}"
 USERNAME_FORMAT = "{username} in {year}"
 BACKUP_THREAD_NAME = "{date} {time}"  # used when the message to create the thread from has no text
 ATTACHMENT_TITLE_TEXT = "<*uploaded a file*> {title}"
@@ -50,12 +50,12 @@ EMOJI_RE = re.compile(r":([^ /<>:]+):(?::skin-tone-(\d):)?")
 __log__ = logging.getLogger(__name__)
 
 
-# Taken from <https://stackoverflow.com/a/54774814>
-def wait_until(end_datetime):
+# Modified from <https://stackoverflow.com/a/54774814>
+async def wait_until(end_datetime):
     while True:
         diff = (end_datetime - datetime.now()).total_seconds()
         if diff < 0: return       # In case end_datetime was in past to begin with
-        time.sleep(diff/2)
+        await asyncio.sleep(diff/2)
         if diff <= 0.1: return
 
 def emoji_replace(s, emoji_map):
@@ -471,8 +471,11 @@ class SlackImportClient(discord.Client):
                 __log__.info("Cleaning up previous webhook %s", webhook)
                 await webhook.delete()
 
-        await asyncio.gather(*[self._run_import_channel(g, chan_name, existing_channels[self._destchannel])
-                               for chan_name, init_topic, pins, is_private in slack_channels(self._data_dir)])
+        # Start importing each channel in a different thread
+        await asyncio.gather(*[
+                self._run_import_channel(g, chan_name, existing_channels[self._destchannel])
+                    for chan_name, init_topic, pins, is_private in slack_channels(self._data_dir)])
+
 
     async def _run_import_channel(self, g, chan_name, dest_ch):
         if self._channels is not None and chan_name.lower() not in self._channels:
@@ -501,12 +504,11 @@ class SlackImportClient(discord.Client):
             msg_dt = datetime.combine(msg["datetime"].date(), msg["datetime"].time())
             timeshifted = msg_dt + timedelta(days=self._timeshift)
             if timeshifted < datetime.now():
-                __log__.info("Skipping message from %s", msg_dt)
                 continue
             # Wait until messages are ready to post
             if timeshifted > datetime.now():
-                __log__.info("Waiting until %s (%s)", timeshifted, (timeshifted-datetime.now()))
-                wait_until(timeshifted)
+                __log__.info("Waiting until %s (%s) for #%s", timeshifted, (timeshifted-datetime.now()), chan_name)
+                await wait_until(timeshifted)
                 #wait_until(datetime.now()+timedelta(seconds=5)) # USE THIS FOR TESTING
 
             # Send message and threaded replies
