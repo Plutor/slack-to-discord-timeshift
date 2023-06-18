@@ -32,8 +32,8 @@ DATE_FORMAT = "%Y-%m-%d"
 TIME_FORMAT = "%H:%M"
 
 # Formatting options for messages
-MSG_FORMAT = "`[#{channel}]` {text}"
-USERNAME_FORMAT = "{username} in {year}"
+USERNAME_FORMAT = "#{channel} in {year}"
+MSG_FORMAT = "`<{username}>` {text}"
 BACKUP_THREAD_NAME = "{date} {time}"  # used when the message to create the thread from has no text
 ATTACHMENT_TITLE_TEXT = "<*uploaded a file*> {title}"
 ATTACHMENT_ERROR_APPEND = "\n<original file not uploaded due to size restrictions. See original at <{url}>>"
@@ -469,7 +469,7 @@ class SlackImportClient(discord.Client):
         for webhook in await g.webhooks():
             if webhook.user == self.user and webhook.name == "SlackTimeshifted":
                 __log__.info("Cleaning up previous webhook %s", webhook)
-                await webhook.delete()
+                #await webhook.delete()
         dest_ch = existing_channels[self._destchannel]
         ch_webhook = await dest_ch.create_webhook(
             name="SlackTimeshifted",
