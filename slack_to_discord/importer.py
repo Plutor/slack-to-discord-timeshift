@@ -467,29 +467,29 @@ class SlackImportClient(discord.Client):
         existing_channels = {x.name: x for x in g.text_channels}
 
         for webhook in await g.webhooks():
-            if webhook.user == self.user and webhook.name == "s2d-importer":
+            if webhook.user == self.user and webhook.name == "SlackTimeshifted":
                 __log__.info("Cleaning up previous webhook %s", webhook)
                 await webhook.delete()
+        dest_ch = existing_channels[self._destchannel]
+        ch_webhook = await dest_ch.create_webhook(
+            name="SlackTimeshifted",
+            reason="For importing timeshifted messages",
+        )
+        ch_send = functools.partial(ch_webhook.send, wait=True)
 
         # Start importing each channel in a different thread
         await asyncio.gather(*[
-                self._run_import_channel(g, chan_name, existing_channels[self._destchannel])
+                self._run_import_channel(g, chan_name, ch_send)
                     for chan_name, init_topic, pins, is_private in slack_channels(self._data_dir)])
 
 
-    async def _run_import_channel(self, g, chan_name, dest_ch):
+    async def _run_import_channel(self, g, chan_name, ch_send):
         if self._channels is not None and chan_name.lower() not in self._channels:
             __log__.info("Skipping channel '#%s' - not in the list of channels to import", chan_name)
             return
 
         emoji_map = {x.name: str(x) for x in self.emojis}
         __log__.info("Processing channel '#%s'...", chan_name)
-
-        ch_webhook = await dest_ch.create_webhook(
-            name="SlackTimeshifted",
-            reason="For importing timeshifted messages",
-        )
-        ch_send = functools.partial(ch_webhook.send, wait=True)
 
         self._prev_msg = None  # always start with the date in a new channel
 
